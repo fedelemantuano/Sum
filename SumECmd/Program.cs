@@ -26,6 +26,8 @@ public class ApplicationArguments
 {
     public string Directory { get; set; }
     public string CsvDirectory { get; set; }
+    public string JsonDirectory { get; set; }
+    public string JsonFileName { get; set; }
 
     public string DateTimeFormat { get; set; }
 
@@ -40,7 +42,6 @@ internal class Program
 {
     
     private static readonly string BaseDirectory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-    private static DateTimeOffset _timestamp;
 
     private static readonly string Header =
         $"SumECmd version {Assembly.GetExecutingAssembly().GetName().Version}" +
@@ -49,6 +50,7 @@ internal class Program
 
 
     private static readonly string Footer = @"Examples: SumECmd.exe -d ""C:\Temp\sum"" --csv ""C:\Temp\"" " + "\r\n\t " +
+                                            @"SumECmd.exe -d ""C:\Temp\sum"" --json ""C:\Temp\json"" --jsonf sum.json" +
                                             "\r\n\t" +
                                             "     Short options (single letter) are prefixed with a single dash. Long commands are prefixed with two dashes\r\n";
 
@@ -70,31 +72,54 @@ internal class Program
     
    
 
-    private static async Task Main(string[] args)
+    private static async Task<int> Main(string[] args)
     {
         ExceptionlessClient.Default.Startup("3DWn5we5zp92pJRvMetSThai8YZCuJQf7Lx3ssLl");
 
         _args = args;
+        _rootCommand = CreateCommand(options => DoWork(options.Directory, options.CsvDirectory,
+            options.JsonDirectory, options.JsonFileName, options.WithDetail, options.DateTimeFormat,
+            options.Debug, options.Trace));
+        try
+        {
+            return await _rootCommand.Parse(args).InvokeAsync();
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
+    }
 
+    internal static RootCommand CreateCommand(Func<ApplicationArguments, int> action)
+    {
         var dOpt = new Option<string>("-d")
         {
-            Description = "Directory to process, looking for SystemIdentity.mdb, Current.mdb, etc. Required.\r\n"
+            Description = "Directory to process, looking for SystemIdentity.mdb, Current.mdb, etc. Required.\r\n",
+            Required = true
         };
         
         var csvOpt = new Option<string>("--csv")
         {
-            Description = "Directory to save CSV formatted results to. Be sure to include the full path in double quotes\r\n"
+            Description = "Directory to save CSV formatted results to. This or --json is required\r\n"
         };
-        
+        var jsonOpt = new Option<string>("--json")
+        {
+            Description = "Directory to save JSON Lines results to. This or --csv is required"
+        };
+        var jsonfOpt = new Option<string>("--jsonf")
+        {
+            Description = "File name to save JSON Lines results to. Overrides the default name; requires --json"
+        };
+
         var wdOpt = new Option<bool>("--wd")
         {
-            Description = "Generate CSV with day level details. Default is TRUE",
+            Description = "Include day level details in CSV and JSON. Default is TRUE",
             DefaultValueFactory = _ => true
         };
         
         var dtOpt = new Option<string>("--dt")
         {
-            Description = "The custom date/time format to use when displaying time stamps. See https://goo.gl/CNVq0k for options",
+            Description = "The custom CSV date/time format. JSON always uses ISO 8601. See https://goo.gl/CNVq0k for options",
             DefaultValueFactory = _ => "yyyy-MM-dd HH:mm:ss"
         };
         
@@ -109,10 +134,12 @@ internal class Program
             DefaultValueFactory = _ => false
         };
 
-        _rootCommand = new RootCommand
+        var command = new RootCommand
         {
            dOpt,
            csvOpt,
+           jsonOpt,
+           jsonfOpt,
            wdOpt,
            dtOpt,
            debugOpt,
@@ -120,17 +147,36 @@ internal class Program
            
         };
             
-        _rootCommand.Description = Header + "\r\n\r\n" + Footer;
-
-        _rootCommand.SetAction(result => DoWork(result.GetValue(dOpt), result.GetValue(csvOpt), result.GetValue(wdOpt),
-            result.GetValue(dtOpt), result.GetValue(debugOpt), result.GetValue(traceOpt)));
-        
-        var foo = _rootCommand.Parse(args).InvokeAsync();
-        
-        Log.CloseAndFlush();
+        command.Description = Header + "\r\n\r\n" + Footer;
+        command.Validators.Add(result =>
+        {
+            if (string.IsNullOrWhiteSpace(result.GetValue(dOpt)))
+                result.AddError("-d is required.");
+            if (string.IsNullOrWhiteSpace(result.GetValue(csvOpt)) && string.IsNullOrWhiteSpace(result.GetValue(jsonOpt)))
+                result.AddError("--csv or --json is required.");
+            var fileName = result.GetValue(jsonfOpt);
+            if (fileName != null)
+            {
+                if (string.IsNullOrWhiteSpace(result.GetValue(jsonOpt)))
+                    result.AddError("--jsonf requires --json.");
+                if (string.IsNullOrWhiteSpace(fileName) || fileName == "." || fileName == ".." ||
+                    fileName.IndexOfAny(new[] { '/', '\\', ':', '*', '?', '"', '<', '>', '|' }) >= 0 ||
+                    fileName.Any(char.IsControl) || fileName.EndsWith(".", StringComparison.Ordinal) ||
+                    fileName.EndsWith(" ", StringComparison.Ordinal))
+                    result.AddError("--jsonf must be a valid file name, without a directory path.");
+            }
+        });
+        command.SetAction(result => action(new ApplicationArguments
+        {
+            Directory = result.GetValue(dOpt), CsvDirectory = result.GetValue(csvOpt),
+            JsonDirectory = result.GetValue(jsonOpt), JsonFileName = result.GetValue(jsonfOpt),
+            WithDetail = result.GetValue(wdOpt), DateTimeFormat = result.GetValue(dtOpt),
+            Debug = result.GetValue(debugOpt), Trace = result.GetValue(traceOpt)
+        }));
+        return command;
     }
 
-    private static void DoWork(string d, string csv,bool wd, string dt, bool debug, bool trace)
+    private static int DoWork(string d, string csv, string json, string jsonf, bool wd, string dt, bool debug, bool trace)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -159,8 +205,7 @@ internal class Program
             Console.WriteLine();
             Log.Fatal("Non-Windows platforms not supported due to the need to load ESI specific Windows libraries! Exiting...");
             Console.WriteLine();
-            Environment.Exit(0);
-            return;
+            return 1;
         }
 
         if (d.IsNullOrEmpty())
@@ -169,7 +214,7 @@ internal class Program
             aaa.Invoke(_rootCommand.Parse("-d is required. Exiting"));
             
             Console.WriteLine();
-            return;
+            return 1;
         }
 
         if (d.IsNullOrEmpty() == false &&
@@ -177,16 +222,16 @@ internal class Program
         {
             Log.Warning("Directory '{D}' not found. Exiting",d);
             Console.WriteLine();
-            return;
+            return 1;
         }
 
-        if (csv.IsNullOrEmpty())
+        if (csv.IsNullOrEmpty() && json.IsNullOrEmpty())
         {
             var aaa = new CustomHelpAction(new HelpAction());
-            aaa.Invoke(_rootCommand.Parse("--csv is required. Exiting"));
+            aaa.Invoke(_rootCommand.Parse("--csv or --json is required. Exiting"));
           
             Console.WriteLine();
-            return;
+            return 1;
         }
 
         Log.Information("{Header}",Header);
@@ -203,7 +248,7 @@ internal class Program
         var sw = new Stopwatch();
         sw.Start();
 
-        _timestamp = DateTimeOffset.UtcNow;
+        var timestamp = DateTimeOffset.UtcNow;
             
         Sum sd = null;
 
@@ -228,7 +273,7 @@ internal class Program
         {
             Log.Error(fe,"File not found: {Message}",fe.Message);
             Console.WriteLine();
-            Environment.Exit(0);
+            return 1;
         }
         catch (Exception e)
         {
@@ -238,7 +283,7 @@ internal class Program
 
             Console.WriteLine();
 
-            Environment.Exit(0);
+            return 1;
         }
 
         Log.Information("The following databases were processed:");
@@ -251,15 +296,24 @@ internal class Program
 
         Log.Information("Exporting data...");
 
-        if (Directory.Exists(csv) == false)
+        var data = new SumExportData(sd);
+        if (!csv.IsNullOrEmpty())
         {
-            Directory.CreateDirectory(csv);
+            ExportCsv(data, csv, dt, wd, timestamp);
         }
-        ExportSystemIdentity(sd,csv,dt);
-        ExportSystemRole(sd,csv);
-        ExportChainedDb(sd,csv);
-            
-        ExportProcessedDetails(sd,csv,dt,wd);
+        if (!json.IsNullOrEmpty())
+        {
+            try
+            {
+                var outputPath = JsonLinesExporter.Export(data, json, jsonf, timestamp, wd);
+                Log.Information("JSON Lines output saved to {OutputPath}", outputPath);
+            }
+            catch (Exception e)
+            {
+                Log.Error(e, "Error exporting JSON Lines: {Message}", e.Message);
+                return 1;
+            }
+        }
 
         sw.Stop();
 
@@ -267,11 +321,21 @@ internal class Program
 
         Log.Information("Processing completed in {TotalSeconds:N4} seconds",sw.Elapsed.TotalSeconds);
         Console.WriteLine();
+        return 0;
     }
 
-    private static CsvWriter GetCsvWriter(string tableName, string csv)
+    internal static void ExportCsv(SumExportData data, string csv, string dt, bool wd, DateTimeOffset timestamp)
     {
-        var outName = $"{_timestamp:yyyyMMddHHmmss}_SumECmd_DETAIL_{tableName}_Output.csv";
+        Directory.CreateDirectory(csv);
+        ExportSystemIdentity(data, csv, dt, timestamp);
+        ExportSystemRole(data, csv, timestamp);
+        ExportChainedDb(data, csv, timestamp);
+        ExportProcessedDetails(data, csv, dt, wd, timestamp);
+    }
+
+    private static CsvWriter GetCsvWriter(string tableName, string csv, DateTimeOffset timestamp)
+    {
+        var outName = $"{timestamp:yyyyMMddHHmmss}_SumECmd_DETAIL_{tableName}_Output.csv";
             
         var outFile = Path.Combine(csv, outName);
 
@@ -284,7 +348,7 @@ internal class Program
         return csvWriter;
     }
 
-    private static void ExportProcessedDetails(Sum sd,string csv, string dt, bool wd)
+    private static void ExportProcessedDetails(SumExportData sd,string csv, string dt, bool wd, DateTimeOffset timestamp)
     {
         CsvWriter csvWriterClients = null;
         CsvWriter csvWriterClientsDetail = null;
@@ -301,7 +365,7 @@ internal class Program
                 {
                     if (csvWriterClients == null)
                     {
-                        csvWriterClients = GetCsvWriter("Clients",csv);
+                        csvWriterClients = GetCsvWriter("Clients",csv,timestamp);
 
                         var mapClient = csvWriterClients.Context.AutoMap<ClientEntry>();
                         mapClient.Map(t => t.InsertDate).Convert(t => $"{t.Value.InsertDate.ToString(dt)}");
@@ -313,7 +377,7 @@ internal class Program
 
                     if (wd && csvWriterClientsDetail == null)
                     {
-                        csvWriterClientsDetail = GetCsvWriter("ClientsDetailed",csv);
+                        csvWriterClientsDetail = GetCsvWriter("ClientsDetailed",csv,timestamp);
 
                         var mapClient = csvWriterClients.Context.AutoMap<ClientEntryDayDetail>();
                         mapClient.Map(t => t.InsertDate).Convert(t => $"{t.Value.InsertDate.ToString(dt)}");
@@ -354,7 +418,7 @@ internal class Program
             {
                 if (csvWriterDns == null)
                 {
-                    csvWriterDns = GetCsvWriter("DnsInfo",csv);
+                    csvWriterDns = GetCsvWriter("DnsInfo",csv,timestamp);
 
                     var mapDns = csvWriterDns.Context.AutoMap<DnsEntry>();
                     mapDns.Map(t => t.LastSeen).Convert(t => $"{t.Value.LastSeen.ToString(dt)}");
@@ -376,7 +440,7 @@ internal class Program
             {
                 if (csvWriterRoles == null)
                 {
-                    csvWriterRoles = GetCsvWriter("RoleAccesses",csv);
+                    csvWriterRoles = GetCsvWriter("RoleAccesses",csv,timestamp);
 
                     var mapRole = csvWriterRoles.Context.AutoMap<RoleAccessEntry>();
                     mapRole.Map(t => t.FirstSeen).Convert(t => $"{t.Value.FirstSeen.ToString(dt)}");
@@ -403,7 +467,7 @@ internal class Program
             {
                 if (csvWriterVm == null)
                 {
-                    csvWriterVm = GetCsvWriter("VmInfo",csv);
+                    csvWriterVm = GetCsvWriter("VmInfo",csv,timestamp);
                     var mapVm = csvWriterVm.Context.AutoMap<VmEntry>();
                     mapVm.Map(t => t.CreationTime).Convert(t => $"{t.Value.CreationTime.ToString(dt)}");
                     mapVm.Map(t => t.LastSeenActive).Convert(t => $"{t.Value.LastSeenActive.ToString(dt)}");
@@ -454,19 +518,24 @@ internal class Program
         {
             Log.Information("Found {Rows:N0} VM entries",csvWriterVm.Row - 2);
         }
+        csvWriterClients?.Dispose();
+        csvWriterClientsDetail?.Dispose();
+        csvWriterDns?.Dispose();
+        csvWriterRoles?.Dispose();
+        csvWriterVm?.Dispose();
     }
 
-    private static void ExportChainedDb(Sum sd, string csv)
+    private static void ExportChainedDb(SumExportData sd, string csv, DateTimeOffset timestamp)
     {
         try
         {
-            var outName = $"{_timestamp:yyyyMMddHHmmss}_SumECmd_SUMMARY_ChainedDbInfo_Output.csv";
+            var outName = $"{timestamp:yyyyMMddHHmmss}_SumECmd_SUMMARY_ChainedDbInfo_Output.csv";
 
             var outFile = Path.Combine(csv, outName);
 
-            var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+            using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-            var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+            using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
             var foo = csvWriter.Context.AutoMap<ChainedDbInfo>();
 
@@ -485,17 +554,17 @@ internal class Program
         }
     }
 
-    private static void ExportSystemRole(Sum sd, string csv)
+    private static void ExportSystemRole(SumExportData sd, string csv, DateTimeOffset timestamp)
     {
         try
         {
-            var outName = $"{_timestamp:yyyyMMddHHmmss}_SumECmd_SUMMARY_RoleInfos_Output.csv";
+            var outName = $"{timestamp:yyyyMMddHHmmss}_SumECmd_SUMMARY_RoleInfos_Output.csv";
 
             var outFile = Path.Combine(csv, outName);
 
-            var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+            using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-            var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+            using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
             var foo = csvWriter.Context.AutoMap<RoleInfo>();
 
@@ -514,17 +583,17 @@ internal class Program
         }
     }
 
-    private static void ExportSystemIdentity(Sum sd, string csv, string dt)
+    private static void ExportSystemIdentity(SumExportData sd, string csv, string dt, DateTimeOffset timestamp)
     {
         try
         {
-            var outName = $"{_timestamp:yyyyMMddHHmmss}_SumECmd_SUMMARY_SystemIdentInfo_Output.csv";
+            var outName = $"{timestamp:yyyyMMddHHmmss}_SumECmd_SUMMARY_SystemIdentInfo_Output.csv";
 
             var outFile = Path.Combine(csv, outName);
 
-            var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+            using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-            var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+            using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
             var foo = csvWriter.Context.AutoMap<SystemIdentInfo>();
 
