@@ -1,474 +1,206 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
-using Microsoft.Isam.Esent.Interop;
 using Serilog;
-
+using SumData.Readers;
 
 namespace SumData
 {
     public class Sum
     {
-        public Sum(string directory)
+        private readonly IEseReader _reader;
+        private static readonly string[] IdentityTables = { "SYSTEM_IDENTITY", "ROLE_IDS", "CHAINED_DATABASES" };
+        private static readonly string[] ActivityTables = { "CLIENTS", "DNS", "ROLE_ACCESS", "VIRTUALMACHINES" };
+
+        private static readonly Dictionary<string, string[]> RequiredColumns = new Dictionary<string, string[]>
         {
-            //https://docs.microsoft.com/en-us/previous-versions/windows/desktop/ual/msftual-hyperv
-            //find systemidentity.mdb
-            //get tables
-            //Role_IDs for guid discovery
-            //system_identity for os info
-            //chained_databases for other things to look for
+            ["SYSTEM_IDENTITY"] = new[] { "CreationTime", "OSMajor", "OSMinor", "OSBuildNumber" },
+            ["ROLE_IDS"] = new[] { "RoleGuid", "ProductName", "RoleName" },
+            ["CHAINED_DATABASES"] = new[] { "Year", "FileName" },
+            ["CLIENTS"] = new[] { "RoleGuid", "TenantId", "Address", "AuthenticatedUserName", "ClientName", "InsertDate", "LastAccess", "TotalAccesses" }
+                .Concat(Enumerable.Range(1, 366).Select(day => "Day" + day)).ToArray(),
+            ["DNS"] = new[] { "LastSeen", "Address", "HostName" },
+            ["ROLE_ACCESS"] = new[] { "RoleGuid", "FirstSeen", "LastSeen" },
+            ["VIRTUALMACHINES"] = new[] { "VmGuid", "BIOSGuid", "CreationTime", "LastSeenActive", "SerialNumber" }
+        };
 
-            //current.mdb is...current
-            //for each file in chained, process, if it exists
+        public Sum(string directory) : this(directory, EseReaderKind.Auto) { }
 
-            //for each table in systemident, dump
+        public Sum(string directory, EseReaderKind reader)
+            : this(directory, CreateReader(reader)) { }
 
+        internal Sum(string directory, IEseReader reader)
+        {
+            _reader = reader;
             SystemIdentityInfos = new List<SystemIdentInfo>();
             RoleInfos = new List<RoleInfo>();
             ChainedDbs = new List<ChainedDbInfo>();
             ProcessedDatabases = new List<ChainedDatabase>();
-
-            if (Directory.Exists(directory) == false)
-            {
+            if (!Directory.Exists(directory))
                 throw new DirectoryNotFoundException($"Directory '{directory}' not found!");
-            }
-
-            var mdbFiles = Directory.GetFiles(directory, "*.mdb");
-
-            var sysIdent = Path.Combine(directory, "SystemIdentity.mdb");
-
-            if (File.Exists(sysIdent) == false)
+            directory = Path.GetFullPath(directory);
+            var sysIdent = FindDatabase(directory, "SystemIdentity.mdb");
+            var current = FindDatabase(directory, "Current.mdb");
+            if (sysIdent == null) throw new FileNotFoundException("SystemIdentity.mdb not found.");
+            if (current == null) throw new FileNotFoundException("Current.mdb not found.");
+            Read(sysIdent, IdentityTables, null, 0);
+            // Preserve SumECmd's existing Current.mdb year convention.
+            ReadActivity(current, DateTime.Now.Year);
+            var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { current };
+            foreach (var chain in ChainedDbs)
             {
-                throw new FileNotFoundException($"File '{sysIdent}' not found!");
-            }
-
-            Log.Information("Found '{SysIdent}'. Processing...",sysIdent);
-
-            ProcessSystemIdentityDatabase(sysIdent);
-
-            var currentDb = Path.Combine(directory, "Current.mdb");
-
-            if (File.Exists(currentDb) == false)
-            {
-                throw new FileNotFoundException($"File '{currentDb}' not found!");
-            }
-          
-            Log.Information("Found '{CurrentDb}'. Processing...",currentDb);
-            ProcessDatabase(currentDb,DateTime.Now.Year);
-
-            foreach (var chainedDbInfo in ChainedDbs)
-            {
-                var chainFile = Path.Combine(directory, chainedDbInfo.FileName);
-
-                if (File.Exists(chainFile) == false)
+                // Database metadata must never select a file outside the evidence directory.
+                if (string.IsNullOrWhiteSpace(chain.FileName) || chain.FileName == "." || chain.FileName == ".." ||
+                    chain.FileName.IndexOfAny(new[] { '/', '\\', ':' }) >= 0)
+                    throw new InvalidDataException("CHAINED_DATABASES contains an invalid file name.");
+                var path = FindDatabase(directory, chain.FileName);
+                if (path == null)
                 {
-                    Log.Information("Chained database '{ChainFile}' for year {Year} does not exist! Skipping...",chainFile,chainedDbInfo.Year);
+                    HasIncompleteData = true;
+                    Log.Warning("Chained database '{FileName}' for year {Year} is missing. Output is incomplete.", chain.FileName, chain.Year);
                     continue;
                 }
-                
-                Log.Information("Found '{ChainFile}' for year {Year}. Processing...",chainFile,chainedDbInfo.Year);
-                ProcessDatabase(chainFile,chainedDbInfo.Year);
+                if (processed.Add(path)) ReadActivity(path, chain.Year);
             }
         }
 
-        public string GetRoleDescFromGuid(Guid roleGuid)
-        {
-            var r = RoleInfos.SingleOrDefault(t => t.RoleGuid == roleGuid);
+        private static string FindDatabase(string directory, string name) => Directory.EnumerateFiles(directory)
+            .SingleOrDefault(file => string.Equals(Path.GetFileName(file), name, StringComparison.OrdinalIgnoreCase));
 
-            return r?.RoleName;
+        internal static IEseReader CreateReader(EseReaderKind kind)
+        {
+            var windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            if (kind == EseReaderKind.Auto) kind = windows ? EseReaderKind.Esent : EseReaderKind.Dissect;
+            if (kind == EseReaderKind.Dissect) return new DissectReader();
+            if (kind != EseReaderKind.Esent) throw new ArgumentOutOfRangeException(nameof(kind));
+            if (!windows) throw new PlatformNotSupportedException("The esent reader requires Windows. Use --reader dissect or auto.");
+            return new ManagedEsentReader();
         }
 
+        public string GetRoleDescFromGuid(Guid roleGuid) => RoleInfos.SingleOrDefault(r => r.RoleGuid == roleGuid)?.RoleName;
         public List<SystemIdentInfo> SystemIdentityInfos { get; }
         public List<RoleInfo> RoleInfos { get; }
         public List<ChainedDbInfo> ChainedDbs { get; }
-
         public List<ChainedDatabase> ProcessedDatabases { get; }
+        public bool HasIncompleteData { get; private set; }
 
-        
-        //esentutl.exe /r svc /a  # ?? need toi test this vs /i for current
-        //esentutl.exe /p .\Current.mdb
-
-        private void ProcessDatabase(string dbFile,int year)
+        private void ReadActivity(string path, int year)
         {
-            using var instance = new Instance("dbFiile");
-            instance.Parameters.LogFileDirectory = Path.GetDirectoryName(dbFile);
-            instance.Parameters.SystemDirectory = Path.GetDirectoryName(dbFile);
-            //instance.Parameters.BaseName = "SRU";
-            instance.Parameters.TempDirectory = Path.GetDirectoryName(dbFile);
-            instance.Parameters.EnableIndexCleanup = true;
+            var db = new ChainedDatabase(path);
+            Read(path, ActivityTables, db, year);
+            ProcessedDatabases.Add(db);
+        }
 
-            //instance.Parameters.Recovery = true;
-
-            instance.Init();
-
-            var chainedDb = new ChainedDatabase(dbFile);
-
-            Log.Debug("Setting up dbFile session for '{DbFile}'",dbFile);
-            using var session = new Session(instance);
-            Api.JetAttachDatabase(session, dbFile, AttachDatabaseGrbit.DeleteCorruptIndexes);
-            Api.JetOpenDatabase(session, dbFile, null, out var dbid, OpenDatabaseGrbit.ReadOnly);
-            
-            Log.Debug("Getting Clients info");
-            try
+        private void Read(string path, string[] tables, ChainedDatabase db, int year)
+        {
+            Log.Information("Reading '{FileName}'...", path);
+            var counts = tables.ToDictionary(name => name, _ => 0);
+            foreach (var record in _reader.ReadDatabase(path, tables))
             {
-                using var rolesTable = new Table(session, dbid, "CLIENTS", OpenTableGrbit.ReadOnly);
-
-                Api.JetSetTableSequential(session, rolesTable, SetTableSequentialGrbit.None);
-
-                Api.MoveBeforeFirst(session, rolesTable);
-
-                while (Api.TryMoveNext(session, rolesTable))
+                if (record.Kind == "database")
                 {
-                    var authUserName = Api.RetrieveColumnAsString(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "AuthenticatedUserName")).Trim('\0');
-                    var clientName = Api.RetrieveColumnAsString(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "ClientName"))?.Trim('\0');
-
-                    var idRaw = Api.RetrieveColumnAsInt64(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "InsertDate"));
-                    var insertDate = DateTimeOffset.FromFileTime(idRaw.Value).ToUniversalTime();
-
-                    var laRaw = Api.RetrieveColumnAsInt64(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "LastAccess"));
-                    var lastAccess = DateTimeOffset.FromFileTime(laRaw.Value).ToUniversalTime();
-                 
-                    var roleGuid = Api.RetrieveColumnAsGuid(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "RoleGuid"));
-                    var tenantId = Api.RetrieveColumnAsGuid(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "TenantId"));
-                    var address = Api.RetrieveColumn(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "Address"));
-                    var totalAccess = Api.RetrieveColumnAsInt32(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "TotalAccesses"));
-
-                    if (chainedDb.Clients.ContainsKey(roleGuid.Value) == false)
+                    if (record.State != 3)
                     {
-                        chainedDb.Clients.Add(roleGuid.Value,new List<ClientEntry>());
+                        HasIncompleteData = true;
+                        Log.Warning("'{FileName}': ESE state {State} ({StateName}). Reading stored pages only; transaction logs are not replayed. Output may be incomplete.",
+                            path, record.State, record.State == 2 ? "Dirty Shutdown" : "not Clean Shutdown");
                     }
-
-                    var ce = new ClientEntry(ConvertBytesToIpAddress(address), authUserName, clientName, insertDate, lastAccess, tenantId.Value, totalAccess.Value);
-
-                    for (var i = 1; i <= 366; i++)
+                }
+                else if (record.Kind == "table")
+                {
+                    if (record.Columns == null || !RequiredColumns.TryGetValue(record.Table, out var required) ||
+                        required.Any(column => !record.Columns.ContainsKey(column)))
+                        throw new InvalidDataException($"Unsupported schema for {record.Table} in '{path}': a required column is missing.");
+                }
+                else if (record.Kind == "missing")
+                {
+                    HasIncompleteData = true;
+                    Log.Warning("'{FileName}': table {Table} is missing. Output is incomplete.", path, record.Table);
+                }
+                else if (record.Kind == "row")
+                {
+                    try { AddRecord(record, db, year); }
+                    catch (Exception ex)
                     {
-                       var dayVal = Api.RetrieveColumnAsInt16(session, rolesTable, Api.GetTableColumnid(session, rolesTable, $"Day{i}"));
-                        
-                        if (dayVal.HasValue)
-                        {
-                            var dt = new DateTimeOffset(year, 1, 1, 0, 0, 0, TimeSpan.Zero).AddDays(i - 1);
-
-                            var de = new DayEntry(i, dt, dayVal.Value);
-                         
-                            ce.DayInfo.Add(de);
-                        }
+                        throw new InvalidDataException($"Cannot decode {record.Table}, row {counts[record.Table] + 1}, in '{path}'.", ex);
                     }
-
-                    chainedDb.Clients[roleGuid.Value].Add(ce);
-
-                     Log.Verbose("Added client info: {Ce}",ce);
+                    counts[record.Table]++;
                 }
-
-                Api.JetResetTableSequential(session, rolesTable, ResetTableSequentialGrbit.None);
             }
-            catch (Exception e)
-            {
-                Log.Error(e,"Error processing Clients info: {Message}",e.Message);
-            }
-
-            Log.Debug("Getting DNS info");
-            try
-            {
-                using var dnsTable = new Table(session, dbid, "DNS", OpenTableGrbit.ReadOnly);
-
-                Api.JetSetTableSequential(session, dnsTable, SetTableSequentialGrbit.None);
-
-                Api.MoveBeforeFirst(session, dnsTable);
-
-                while (Api.TryMoveNext(session, dnsTable))
-                {
-                    var address = Api.RetrieveColumnAsString(session, dnsTable, Api.GetTableColumnid(session, dnsTable, "Address")).Trim('\0');
-                    var hostName = Api.RetrieveColumnAsString(session, dnsTable, Api.GetTableColumnid(session, dnsTable, "HostName"))?.Trim('\0');
-
-                    var idRaw = Api.RetrieveColumnAsInt64(session, dnsTable, Api.GetTableColumnid(session, dnsTable, "LastSeen"));
-                    var lastSeen = DateTimeOffset.FromFileTime(idRaw.Value).ToUniversalTime();
-
-                  var dns = new DnsEntry(lastSeen,address,hostName);
-
-                    chainedDb.DnsInfo.Add(dns);
-                    Log.Verbose("Added DNS info: {Dns}",dns);
-                }
-
-                Api.JetResetTableSequential(session, dnsTable, ResetTableSequentialGrbit.None);
-
-            }
-            catch (Exception e)
-            {
-                Log.Error(e,"Error processing DNS info: {Message}",e.Message);
-            }
-
-
-            Log.Debug("Getting Role Access info");
-            try
-            {
-                using var rolesTable = new Table(session, dbid, "ROLE_ACCESS", OpenTableGrbit.ReadOnly);
-
-                Api.JetSetTableSequential(session, rolesTable, SetTableSequentialGrbit.None);
-
-                Api.MoveBeforeFirst(session, rolesTable);
-
-                while (Api.TryMoveNext(session, rolesTable))
-                {
-                    var idRaw = Api.RetrieveColumnAsInt64(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "FirstSeen"));
-                    var firstSeen = DateTimeOffset.FromFileTime(idRaw.Value).ToUniversalTime();
-
-                    var laRaw = Api.RetrieveColumnAsInt64(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "LastSeen"));
-                    var lastSeen = DateTimeOffset.FromFileTime(laRaw.Value).ToUniversalTime();
-                 
-                    var roleGuid = Api.RetrieveColumnAsGuid(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "RoleGuid"));
-
-                    var re = new RoleAccessEntry(firstSeen, lastSeen, roleGuid.Value);
-
-                    chainedDb.RoleAccesses.Add(re);
-                    Log.Verbose("Added role access info: {Re}",re);
-                }
-
-                Api.JetResetTableSequential(session, rolesTable, ResetTableSequentialGrbit.None);
-
-            }
-            catch (Exception e)
-            {
-                Log.Error(e,"Error processing Role Access info: {Message}",e.Message);
-            }
-
-            Log.Debug("Getting Virtual Machines info");
-            try
-            {
-                using var vmTable = new Table(session, dbid, "VIRTUALMACHINES", OpenTableGrbit.ReadOnly);
-
-                Api.JetSetTableSequential(session, vmTable, SetTableSequentialGrbit.None);
-
-                Api.MoveBeforeFirst(session, vmTable);
-
-                while (Api.TryMoveNext(session, vmTable))
-                {
-                    var serialNumber = Api.RetrieveColumnAsString(session, vmTable, Api.GetTableColumnid(session, vmTable, "SerialNumber")).Trim('\0');
-
-                    var idRaw = Api.RetrieveColumnAsInt64(session, vmTable, Api.GetTableColumnid(session, vmTable, "CreationTime"));
-                    var creationTime = DateTimeOffset.FromFileTime(idRaw.Value).ToUniversalTime();
-
-                    var laRaw = Api.RetrieveColumnAsInt64(session, vmTable, Api.GetTableColumnid(session, vmTable, "LastSeenActive"));
-                    var lastSeenActive = DateTimeOffset.FromFileTime(laRaw.Value).ToUniversalTime();
-                 
-                    var biosGuid = Api.RetrieveColumnAsGuid(session, vmTable, Api.GetTableColumnid(session, vmTable, "BIOSGuid"));
-                    var vmGuid = Api.RetrieveColumnAsGuid(session, vmTable, Api.GetTableColumnid(session, vmTable, "VmGuid"));
-
-                    var vm = new VmEntry(biosGuid.Value, vmGuid.Value, creationTime, lastSeenActive, serialNumber);
-
-                    chainedDb.VmInfo.Add(vm);
-
-                    Log.Verbose("Added VM info: {Vm}",vm);
-                }
-
-                Api.JetResetTableSequential(session, vmTable, ResetTableSequentialGrbit.None);
-
-
-            }
-            catch (Exception e)
-            {
-                Log.Error(e,"Error processing Virtual Machine info: {Message}",e.Message);
-            }
-     
-
-            //all done, so add it to list
-            ProcessedDatabases.Add(chainedDb);
-
+            foreach (var count in counts) Log.Information("  {Table}: {Count} records", count.Key, count.Value);
         }
 
-        private string ConvertBytesToIpAddress(byte[] rawBytes)
+        private void AddRecord(EseRecord row, ChainedDatabase db, int year)
         {
-            var sb = new StringBuilder();
-            var counter = 1;
-
-            string ip;
-
-            if (rawBytes.Length > 10)
+            switch (row.Table)
             {
-                foreach (var rawByte in rawBytes)
-                {
-                    sb.Append(rawByte.ToString("X2"));
-                    if (counter % 2 == 0)
+                case "SYSTEM_IDENTITY":
+                    SystemIdentityInfos.Add(new SystemIdentInfo(row.Timestamp("CreationTime"), row.Byte("OSMajor"), row.Byte("OSMinor"), row.Int16("OSBuildNumber")));
+                    break;
+                case "ROLE_IDS":
+                    RoleInfos.Add(new RoleInfo(row.Guid("RoleGuid"), row.Text("ProductName"), row.Text("RoleName")));
+                    break;
+                case "CHAINED_DATABASES":
+                    ChainedDbs.Add(new ChainedDbInfo(row.Int16("Year"), row.Text("FileName")));
+                    break;
+                case "CLIENTS":
+                    var roleGuid = row.Guid("RoleGuid");
+                    var client = new ClientEntry(ConvertBytesToIpAddress(row.Bytes("Address")), row.Text("AuthenticatedUserName"),
+                        row.Text("ClientName"), row.Timestamp("InsertDate"), row.Timestamp("LastAccess"), row.Guid("TenantId"), row.Int32("TotalAccesses"));
+                    for (var day = 1; day <= 366; day++)
                     {
-                        sb.Append(":");
+                        var column = "Day" + day;
+                        if (row.Bytes(column) != null)
+                            client.DayInfo.Add(new DayEntry(day, new DateTimeOffset(year, 1, 1, 0, 0, 0, TimeSpan.Zero).AddDays(day - 1), row.Int16(column)));
                     }
-
-                    counter += 1;
-                }
-                ip = sb.ToString().Trim(':');
-                
-            }
-            else
-            {
-                //v4
-                foreach (var rawByte in rawBytes)
-                {
-                    sb.Append($"{rawByte}.");
-                }
-
-                ip = sb.ToString().Trim('.');
-            }
-
-
-            return ip;
-        }
-
-        private void ProcessSystemIdentityDatabase(string sysIdent)
-        {
-            using var instance = new Instance("sysIdent");
-            instance.Parameters.LogFileDirectory = Path.GetDirectoryName(sysIdent);
-            instance.Parameters.SystemDirectory = Path.GetDirectoryName(sysIdent);
-            //instance.Parameters.BaseName = "SRU";
-            instance.Parameters.TempDirectory = Path.GetDirectoryName(sysIdent);
-
-            //instance.Parameters.Recovery = false;            
-
-            instance.Init();
-
-            Log.Debug("Setting up session for SystemIdentity");
-            using var session = new Session(instance);
-            Api.JetAttachDatabase(session, sysIdent, AttachDatabaseGrbit.ReadOnly);
-            Api.JetOpenDatabase(session, sysIdent, null, out var dbid, OpenDatabaseGrbit.ReadOnly);
-
-            Log.Debug("Getting System identity info");
-            try
-            {
-                GetSystemIdentityInfo(session, dbid);
-            }
-            catch (Exception e)
-            {
-                Log.Error(e,"Error processing System identity info: {Message}",e.Message);
-            }
-
-
-            Log.Debug("Getting Role Id info");
-            try
-            {
-                GetRoleIdInfo(session, dbid);
-            }
-            catch (Exception e)
-            {
-                Log.Error(e,"Error Role IDs info: {Message}",e.Message);
-            }
-
-            Log.Debug("Getting Chained database info");
-            try
-            {
-                GetChainedDatabaseInfo(session, dbid);
-            }
-            catch (Exception e)
-            {
-                Log.Error(e,"Error processing Chained Database info: {Message}",e.Message);
+                    if (!db.Clients.TryGetValue(roleGuid, out var clients))
+                        db.Clients.Add(roleGuid, clients = new List<ClientEntry>());
+                    clients.Add(client);
+                    break;
+                case "DNS":
+                    db.DnsInfo.Add(new DnsEntry(row.Timestamp("LastSeen"), row.Text("Address"), row.Text("HostName")));
+                    break;
+                case "ROLE_ACCESS":
+                    db.RoleAccesses.Add(new RoleAccessEntry(row.Timestamp("FirstSeen"), row.Timestamp("LastSeen"), row.Guid("RoleGuid")));
+                    break;
+                case "VIRTUALMACHINES":
+                    db.VmInfo.Add(new VmEntry(row.Guid("BIOSGuid"), row.Guid("VmGuid"), row.Timestamp("CreationTime"), row.Timestamp("LastSeenActive"), row.Text("SerialNumber")));
+                    break;
+                default: throw new InvalidDataException("Unexpected UAL table.");
             }
         }
 
-        private void GetChainedDatabaseInfo(Session session, JET_DBID dbid)
+        private static string ConvertBytesToIpAddress(byte[] rawBytes)
         {
-            using var rolesTable = new Table(session, dbid, "CHAINED_DATABASES", OpenTableGrbit.ReadOnly);
-
-            Api.JetSetTableSequential(session, rolesTable, SetTableSequentialGrbit.None);
-
-            Api.MoveBeforeFirst(session, rolesTable);
-
-            while (Api.TryMoveNext(session, rolesTable))
+            if (rawBytes == null) return null;
+            if (rawBytes.Length != 4 && rawBytes.Length != 16)
+                throw new InvalidDataException("An IP address must contain 4 or 16 bytes.");
+            // Preserve the existing CSV/JSON address representation.
+            if (rawBytes.Length == 4) return string.Join(".", rawBytes);
+            var result = new StringBuilder();
+            for (var i = 0; i < rawBytes.Length; i++)
             {
-                var year = Api.RetrieveColumnAsInt16(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "Year"));
-                var fileName = Api.RetrieveColumnAsString(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "FileName")).Trim('\0');
-
-                var cd = new ChainedDbInfo(year.Value, fileName);
-
-                ChainedDbs.Add(cd);
-
-                Log.Verbose("Added chained db info: {Cd}",cd);
+                if (i > 0 && i % 2 == 0) result.Append(':');
+                result.Append(rawBytes[i].ToString("X2"));
             }
-
-            Api.JetResetTableSequential(session, rolesTable, ResetTableSequentialGrbit.None);
-        }
-
-        private void GetRoleIdInfo(Session session, JET_DBID dbid)
-        {
-            using var rolesTable = new Table(session, dbid, "ROLE_IDS", OpenTableGrbit.ReadOnly);
-
-            Api.JetSetTableSequential(session, rolesTable, SetTableSequentialGrbit.None);
-
-            Api.MoveBeforeFirst(session, rolesTable);
-
-            while (Api.TryMoveNext(session, rolesTable))
-            {
-                var roleGuid = Api.RetrieveColumnAsGuid(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "RoleGuid"));
-                var prodName = Api.RetrieveColumnAsString(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "ProductName")).Trim('\0');
-                var roleName = Api.RetrieveColumnAsString(session, rolesTable, Api.GetTableColumnid(session, rolesTable, "RoleName")).Trim('\0');
-
-                var ri = new RoleInfo(roleGuid.Value, prodName, roleName);
-
-                RoleInfos.Add(ri);
-
-                Log.Verbose("Added role info: {Ri}",ri);
-            }
-
-            Api.JetResetTableSequential(session, rolesTable, ResetTableSequentialGrbit.None);
-        }
-
-        private void GetSystemIdentityInfo(Session session, JET_DBID dbid)
-        {
-            using var systemIdent = new Table(session, dbid, "SYSTEM_IDENTITY", OpenTableGrbit.ReadOnly);
-
-            Api.JetSetTableSequential(session, systemIdent, SetTableSequentialGrbit.None);
-
-            Api.MoveBeforeFirst(session, systemIdent);
-
-            while (Api.TryMoveNext(session, systemIdent))
-            {
-                var dtRaw = Api.RetrieveColumnAsInt64(session, systemIdent, Api.GetTableColumnid(session, systemIdent, "CreationTime"));
-
-                var creationTime = DateTimeOffset.FromFileTime(dtRaw.Value);
-
-                var osMajor = Api.RetrieveColumnAsByte(session, systemIdent, Api.GetTableColumnid(session, systemIdent, "OSMajor"));
-                var osMinor = Api.RetrieveColumnAsByte(session, systemIdent, Api.GetTableColumnid(session, systemIdent, "OSMinor"));
-                var osBuildNum = Api.RetrieveColumnAsInt16(session, systemIdent, Api.GetTableColumnid(session, systemIdent, "OSBuildNumber"));
-
-                var si = new SystemIdentInfo(creationTime.ToUniversalTime(), osMajor.Value, osMinor.Value, osBuildNum.Value);
-
-                SystemIdentityInfos.Add(si);
-
-                Log.Verbose("Added system identity info: {Si}",si);
-            }
-
-            Api.JetResetTableSequential(session, systemIdent, ResetTableSequentialGrbit.None);
+            return result.ToString();
         }
 
         public static void DumpTableInfo(string fileName)
         {
-            if (File.Exists(fileName) == false)
+            if (!File.Exists(fileName)) throw new FileNotFoundException("Database not found.", fileName);
+            foreach (var record in CreateReader(EseReaderKind.Auto).ReadDatabase(fileName, null))
             {
-                throw new FileNotFoundException($"'{fileName}' does not exist!");
-            }
-
-            using var instance = new Instance("pulldata");
-            instance.Parameters.Recovery = false;
-
-            instance.Init();
-
-            using var session = new Session(instance);
-            Api.JetAttachDatabase(session, fileName, AttachDatabaseGrbit.ReadOnly);
-            Api.JetOpenDatabase(session, fileName, null, out var dbid, OpenDatabaseGrbit.ReadOnly);
-
-            foreach (var table in Api.GetTableNames(session, dbid))
-            {
-                Console.WriteLine($"TABLE: {table}");
-
-                foreach (var column in Api.GetTableColumns(session, dbid, table))
-                {
-                    Console.WriteLine("\t{0}: {1}", column.Name, column.Coltyp);
-                }
-
+                if (record.Kind != "table") continue;
+                Console.WriteLine($"TABLE: {record.Table}");
+                foreach (var column in record.Columns) Console.WriteLine("\t{0}: {1}", column.Key, column.Value);
                 Console.WriteLine("------------------------------------");
             }
         }
     }
-
 
     public class ChainedDatabase
     {

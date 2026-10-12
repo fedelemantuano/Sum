@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.CommandLine;
 using System.CommandLine.Help;
 using System.CommandLine.Invocation;
@@ -19,6 +19,7 @@ using Serilog.Core;
 using Serilog.Events;
 using ServiceStack;
 using SumData;
+using SumData.Readers;
 
 namespace SumECmd;
 
@@ -34,6 +35,7 @@ public class ApplicationArguments
     public bool WithDetail { get; set; }
     public bool Debug { get; set; }
     public bool Trace { get; set; }
+    public EseReaderKind Reader { get; set; }
 }
 
 
@@ -79,7 +81,7 @@ internal class Program
         _args = args;
         _rootCommand = CreateCommand(options => DoWork(options.Directory, options.CsvDirectory,
             options.JsonDirectory, options.JsonFileName, options.WithDetail, options.DateTimeFormat,
-            options.Debug, options.Trace));
+            options.Debug, options.Trace, options.Reader));
         try
         {
             return await _rootCommand.Parse(args).InvokeAsync();
@@ -134,6 +136,12 @@ internal class Program
             DefaultValueFactory = _ => false
         };
 
+        var readerOpt = new Option<string>("--reader")
+        {
+            Description = "Database reader: auto (Windows: esent; other platforms: dissect), esent, or dissect",
+            DefaultValueFactory = _ => "auto"
+        };
+
         var command = new RootCommand
         {
            dOpt,
@@ -143,13 +151,17 @@ internal class Program
            wdOpt,
            dtOpt,
            debugOpt,
-           traceOpt
+           traceOpt,
+           readerOpt
            
         };
             
         command.Description = Header + "\r\n\r\n" + Footer;
         command.Validators.Add(result =>
         {
+            var reader = result.GetValue(readerOpt) ?? "auto";
+            if (reader != "auto" && reader != "esent" && reader != "dissect")
+                result.AddError("--reader must be auto, esent, or dissect.");
             if (string.IsNullOrWhiteSpace(result.GetValue(dOpt)))
                 result.AddError("-d is required.");
             if (string.IsNullOrWhiteSpace(result.GetValue(csvOpt)) && string.IsNullOrWhiteSpace(result.GetValue(jsonOpt)))
@@ -171,12 +183,13 @@ internal class Program
             Directory = result.GetValue(dOpt), CsvDirectory = result.GetValue(csvOpt),
             JsonDirectory = result.GetValue(jsonOpt), JsonFileName = result.GetValue(jsonfOpt),
             WithDetail = result.GetValue(wdOpt), DateTimeFormat = result.GetValue(dtOpt),
-            Debug = result.GetValue(debugOpt), Trace = result.GetValue(traceOpt)
+            Debug = result.GetValue(debugOpt), Trace = result.GetValue(traceOpt),
+            Reader = (EseReaderKind)Enum.Parse(typeof(EseReaderKind), result.GetValue(readerOpt) ?? "auto", true)
         }));
         return command;
     }
 
-    private static int DoWork(string d, string csv, string json, string jsonf, bool wd, string dt, bool debug, bool trace)
+    private static int DoWork(string d, string csv, string json, string jsonf, bool wd, string dt, bool debug, bool trace, EseReaderKind reader)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -200,14 +213,6 @@ internal class Program
       
         Log.Logger = conf.CreateLogger();
         
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            Console.WriteLine();
-            Log.Fatal("Non-Windows platforms not supported due to the need to load ESI specific Windows libraries! Exiting...");
-            Console.WriteLine();
-            return 1;
-        }
-
         if (d.IsNullOrEmpty())
         {
             var aaa = new CustomHelpAction(new HelpAction());
@@ -256,7 +261,7 @@ internal class Program
         {
             Log.Information("Processing '{D}'...",d);
             Console.WriteLine();
-            sd = new Sum(d);
+            sd = new Sum(d, reader);
             Console.WriteLine();
             Log.Information("Processing complete!");
             Console.WriteLine();
@@ -277,12 +282,7 @@ internal class Program
         }
         catch (Exception e)
         {
-            Log.Error(e,"Error processing file! Message: {Message}.\r\n\r\nThis almost always means the database is dirty and must be repaired. This can be verified by running 'esentutl.exe /mh <dbname>.mdb' and examining the 'State' property",e.Message);
-            Console.WriteLine();
-            Log.Information("If the database is dirty, **make a copy of your files**, ensure all files in the directory are not Read-only, open a PowerShell session as an admin, and repair by using the following commands (change directories to the location of <dbname>.mdb first):\r\n\r\n'esentutl.exe /r svc /i'\r\n'esentutl.exe /p <dbname>.mdb'\r\n\r\n");
-
-            Console.WriteLine();
-
+            Log.Error(e, "Error reading SUM databases: {Message}. No output was exported.", e.Message);
             return 1;
         }
 
@@ -321,6 +321,11 @@ internal class Program
 
         Log.Information("Processing completed in {TotalSeconds:N4} seconds",sw.Elapsed.TotalSeconds);
         Console.WriteLine();
+        if (sd.HasIncompleteData)
+        {
+            Log.Warning("Output was exported with completeness warnings. Exit code 2; see the database diagnostics above.");
+            return 2;
+        }
         return 0;
     }
 

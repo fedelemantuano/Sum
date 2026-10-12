@@ -1,0 +1,3 @@
+dissect.database==1.1
+dissect.cstruct==4.7
+dissect.util==3.24

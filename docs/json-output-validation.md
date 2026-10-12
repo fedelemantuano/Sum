@@ -32,3 +32,44 @@ dotnet test SumTest/SumTest.csproj --configuration Release
 ```
 
 Set `SUM_ELASTICSEARCH_URL` to a disposable Elasticsearch endpoint to enable the ingestion test; otherwise that test is skipped. It creates and deletes a uniquely named test index. The usual CI test job installs .NET 9 and runs the remaining automated tests without requiring Elasticsearch.
+
+## Cross-platform ESE reader validation — 2026-10-12
+
+The repository now selects Dissect on non-Windows platforms and ManagedEsent on
+Windows. `--reader dissect` can also be selected explicitly. The Python helper is
+embedded in SumData and passes ESE values to the shared C# UAL mapping; the existing
+CSV/JSON exporters are reused.
+
+Validation performed locally in Linux ARM64 Docker on the Mac:
+
+- 46 C# tests passed; the optional Elasticsearch and external-sample tests were
+  skipped in the default suite. The original explicit Windows sample tests remain
+  excluded. Five Python transport tests passed.
+- Release builds succeeded for `net9.0` and `net472`. The existing ManagedEsent
+  `NU1701` warning remains. Docker builds exclude `.git`, so MinVer also reports
+  its default-version warning in that environment.
+- The separate opt-in C# test passed with `SUM_TEST_SAMPLE_DIR` pointing to the two
+  private databases mounted read-only. No private database is checked in.
+- The actual published `SumECmd` executable, running in the final runtime image,
+  read the same databases and produced 17 JSON records and corresponding CSV rows:
+  3 `SystemIdentInfo`, 13 `RoleInfos`, and 1 `ChainedDbInfo`.
+- Exported identity timestamps matched the raw FILETIME values exactly, including
+  all seven fractional digits. Exported role GUID values matched their source
+  bytes. Synthetic tests additionally exercise non-microsecond FILETIME values.
+- `Current.mdb` had zero readable activity records and state 2 (Dirty Shutdown).
+  A referenced historical database was also missing. Both conditions were logged;
+  the application exported the readable records and returned exit code 2.
+- Fatal cases (invalid ESE database, missing Python executable, explicit `esent`
+  selection on Linux) returned exit code 1 and preserved the existing JSON file.
+- Both original databases retained their SHA-256 hashes after all runs. Containers
+  performing evidence reads had networking disabled and read-only evidence mounts.
+
+This establishes real ESE reading and metadata export on the tested platform. It
+is not evidence of complete activity extraction: the supplied `Current.mdb` has no
+readable activity rows. Populated CLIENTS/DNS/ROLE_ACCESS/VIRTUALMACHINES samples and
+comparison against a live Windows ManagedEsent run are still required for full
+cross-reader acceptance. Windows execution has not been validated locally; the CI
+configuration now includes Windows and Ubuntu, but no remote CI run was triggered.
+
+The existing `Current.mdb` daily-date year convention is preserved, as documented
+in the README. Dissect does not replay transaction logs or perform recovery.
