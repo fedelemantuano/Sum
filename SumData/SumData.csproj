@@ -3,7 +3,7 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <LangVersion>10</LangVersion>
     <Authors>Eric R. Zimmerman</Authors>
-    <Description>Parses Windows SUM databases using ManagedEsent or Dissect</Description>
+    <Description>Parses Windows SUM databases using the included C# ESE library</Description>
     <PackageProjectUrl>https://github.com/EricZimmerman/Sum</PackageProjectUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <Version>2026.5.0</Version>
@@ -16,8 +16,7 @@
     <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
   <ItemGroup>
-    <EmbeddedResource Include="python/ese_reader.py" LogicalName="SumData.ese_reader.py" />
-    <PackageReference Include="Microsoft.Database.ManagedEsent" Version="3.2.0" />
+    <ProjectReference Include="../EseRecovery/EseRecovery.csproj" />
     <PackageReference Include="Serilog" Version="4.3.1" />
 
     <None Include="../README.md" Pack="true" PackagePath=""/>

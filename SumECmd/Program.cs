@@ -19,7 +19,6 @@ using Serilog.Core;
 using Serilog.Events;
 using ServiceStack;
 using SumData;
-using SumData.Readers;
 
 namespace SumECmd;
 
@@ -35,7 +34,6 @@ public class ApplicationArguments
     public bool WithDetail { get; set; }
     public bool Debug { get; set; }
     public bool Trace { get; set; }
-    public EseReaderKind Reader { get; set; }
 }
 
 
@@ -81,7 +79,7 @@ internal class Program
         _args = args;
         _rootCommand = CreateCommand(options => DoWork(options.Directory, options.CsvDirectory,
             options.JsonDirectory, options.JsonFileName, options.WithDetail, options.DateTimeFormat,
-            options.Debug, options.Trace, options.Reader));
+            options.Debug, options.Trace));
         try
         {
             return await _rootCommand.Parse(args).InvokeAsync();
@@ -136,12 +134,6 @@ internal class Program
             DefaultValueFactory = _ => false
         };
 
-        var readerOpt = new Option<string>("--reader")
-        {
-            Description = "Database reader: auto (Windows: esent; other platforms: dissect), esent, or dissect",
-            DefaultValueFactory = _ => "auto"
-        };
-
         var command = new RootCommand
         {
            dOpt,
@@ -151,17 +143,13 @@ internal class Program
            wdOpt,
            dtOpt,
            debugOpt,
-           traceOpt,
-           readerOpt
+           traceOpt
            
         };
             
         command.Description = Header + "\r\n\r\n" + Footer;
         command.Validators.Add(result =>
         {
-            var reader = result.GetValue(readerOpt) ?? "auto";
-            if (reader != "auto" && reader != "esent" && reader != "dissect")
-                result.AddError("--reader must be auto, esent, or dissect.");
             if (string.IsNullOrWhiteSpace(result.GetValue(dOpt)))
                 result.AddError("-d is required.");
             if (string.IsNullOrWhiteSpace(result.GetValue(csvOpt)) && string.IsNullOrWhiteSpace(result.GetValue(jsonOpt)))
@@ -183,13 +171,12 @@ internal class Program
             Directory = result.GetValue(dOpt), CsvDirectory = result.GetValue(csvOpt),
             JsonDirectory = result.GetValue(jsonOpt), JsonFileName = result.GetValue(jsonfOpt),
             WithDetail = result.GetValue(wdOpt), DateTimeFormat = result.GetValue(dtOpt),
-            Debug = result.GetValue(debugOpt), Trace = result.GetValue(traceOpt),
-            Reader = (EseReaderKind)Enum.Parse(typeof(EseReaderKind), result.GetValue(readerOpt) ?? "auto", true)
+            Debug = result.GetValue(debugOpt), Trace = result.GetValue(traceOpt)
         }));
         return command;
     }
 
-    private static int DoWork(string d, string csv, string json, string jsonf, bool wd, string dt, bool debug, bool trace, EseReaderKind reader)
+    private static int DoWork(string d, string csv, string json, string jsonf, bool wd, string dt, bool debug, bool trace)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -261,7 +248,7 @@ internal class Program
         {
             Log.Information("Processing '{D}'...",d);
             Console.WriteLine();
-            sd = new Sum(d, reader);
+            sd = new Sum(d);
             Console.WriteLine();
             Log.Information("Processing complete!");
             Console.WriteLine();
@@ -321,11 +308,6 @@ internal class Program
 
         Log.Information("Processing completed in {TotalSeconds:N4} seconds",sw.Elapsed.TotalSeconds);
         Console.WriteLine();
-        if (sd.HasIncompleteData)
-        {
-            Log.Warning("Output was exported with completeness warnings. Exit code 2; see the database diagnostics above.");
-            return 2;
-        }
         return 0;
     }
 

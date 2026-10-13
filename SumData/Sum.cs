@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text;
 using Serilog;
 using SumData.Readers;
@@ -11,7 +10,7 @@ namespace SumData
 {
     public class Sum
     {
-        private readonly IEseReader _reader;
+        private readonly PortableEseReader _reader;
         private static readonly string[] IdentityTables = { "SYSTEM_IDENTITY", "ROLE_IDS", "CHAINED_DATABASES" };
         private static readonly string[] ActivityTables = { "CLIENTS", "DNS", "ROLE_ACCESS", "VIRTUALMACHINES" };
 
@@ -27,14 +26,9 @@ namespace SumData
             ["VIRTUALMACHINES"] = new[] { "VmGuid", "BIOSGuid", "CreationTime", "LastSeenActive", "SerialNumber" }
         };
 
-        public Sum(string directory) : this(directory, EseReaderKind.Auto) { }
-
-        public Sum(string directory, EseReaderKind reader)
-            : this(directory, CreateReader(reader)) { }
-
-        internal Sum(string directory, IEseReader reader)
+        public Sum(string directory)
         {
-            _reader = reader;
+            _reader = new PortableEseReader();
             SystemIdentityInfos = new List<SystemIdentInfo>();
             RoleInfos = new List<RoleInfo>();
             ChainedDbs = new List<ChainedDbInfo>();
@@ -59,8 +53,7 @@ namespace SumData
                 var path = FindDatabase(directory, chain.FileName);
                 if (path == null)
                 {
-                    HasIncompleteData = true;
-                    Log.Warning("Chained database '{FileName}' for year {Year} is missing. Output is incomplete.", chain.FileName, chain.Year);
+                    Log.Information("Chained database '{FileName}' for year {Year} does not exist! Skipping...", chain.FileName, chain.Year);
                     continue;
                 }
                 if (processed.Add(path)) ReadActivity(path, chain.Year);
@@ -70,22 +63,13 @@ namespace SumData
         private static string FindDatabase(string directory, string name) => Directory.EnumerateFiles(directory)
             .SingleOrDefault(file => string.Equals(Path.GetFileName(file), name, StringComparison.OrdinalIgnoreCase));
 
-        internal static IEseReader CreateReader(EseReaderKind kind)
-        {
-            var windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-            if (kind == EseReaderKind.Auto) kind = windows ? EseReaderKind.Esent : EseReaderKind.Dissect;
-            if (kind == EseReaderKind.Dissect) return new DissectReader();
-            if (kind != EseReaderKind.Esent) throw new ArgumentOutOfRangeException(nameof(kind));
-            if (!windows) throw new PlatformNotSupportedException("The esent reader requires Windows. Use --reader dissect or auto.");
-            return new ManagedEsentReader();
-        }
-
         public string GetRoleDescFromGuid(Guid roleGuid) => RoleInfos.SingleOrDefault(r => r.RoleGuid == roleGuid)?.RoleName;
         public List<SystemIdentInfo> SystemIdentityInfos { get; }
         public List<RoleInfo> RoleInfos { get; }
         public List<ChainedDbInfo> ChainedDbs { get; }
         public List<ChainedDatabase> ProcessedDatabases { get; }
-        public bool HasIncompleteData { get; private set; }
+        private readonly Dictionary<string, EseRecovery.EseRecoveryReport> recoveryReports = new Dictionary<string, EseRecovery.EseRecoveryReport>();
+        public IReadOnlyDictionary<string, EseRecovery.EseRecoveryReport> RecoveryReports => recoveryReports;
 
         private void ReadActivity(string path, int year)
         {
@@ -102,11 +86,11 @@ namespace SumData
             {
                 if (record.Kind == "database")
                 {
-                    if (record.State != 3)
+                    if (record.Recovery != null)
                     {
-                        HasIncompleteData = true;
-                        Log.Warning("'{FileName}': ESE state {State} ({StateName}). Reading stored pages only; transaction logs are not replayed. Output may be incomplete.",
-                            path, record.State, record.State == 2 ? "Dirty Shutdown" : "not Clean Shutdown");
+                        recoveryReports[path] = record.Recovery;
+                        Log.Information("'{FileName}': supported ESE recovery completed; {Redone} operations redone, {Undone} undone.",
+                            path, record.Recovery.RedoneOperations, record.Recovery.UndoneOperations);
                     }
                 }
                 else if (record.Kind == "table")
@@ -117,8 +101,7 @@ namespace SumData
                 }
                 else if (record.Kind == "missing")
                 {
-                    HasIncompleteData = true;
-                    Log.Warning("'{FileName}': table {Table} is missing. Output is incomplete.", path, record.Table);
+                    Log.Error("Error processing table {Table} in '{FileName}': table does not exist. Skipping...", record.Table, path);
                 }
                 else if (record.Kind == "row")
                 {
@@ -192,7 +175,7 @@ namespace SumData
         public static void DumpTableInfo(string fileName)
         {
             if (!File.Exists(fileName)) throw new FileNotFoundException("Database not found.", fileName);
-            foreach (var record in CreateReader(EseReaderKind.Auto).ReadDatabase(fileName, null))
+            foreach (var record in new PortableEseReader().ReadDatabase(fileName, null))
             {
                 if (record.Kind != "table") continue;
                 Console.WriteLine($"TABLE: {record.Table}");

@@ -70,26 +70,13 @@ jobs:
         run: meziantou.validate-nuget-package (Get-ChildItem "${{ env.NuGetDirectory }}/*.nupkg")
 
   run_test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      SUM_PYTHON: python
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '9.0.x'
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-    - name: Install ESE reader
-      run: python -m pip install -r SumData/python/requirements.txt
-    - name: Test Python transport
-      run: python -m unittest discover -s SumTest/python -v
     - name: Run tests
       run: dotnet test --configuration Release
 

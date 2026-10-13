@@ -338,7 +338,3 @@ ASALocalRun/
 
 # BeatPulse healthcheck temp database
 healthchecksdb
-# Python ESE helper
-__pycache__/
-*.py[cod]
-.venv/

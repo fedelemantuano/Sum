@@ -9,7 +9,7 @@ Process Microsoft User Access Logs! Thanks to KPMG for the initial write up, fou
     Author: Eric Zimmerman (saericzimmerman@gmail.com)
     https://github.com/EricZimmerman/Sum
 
-        d               Directory to recursively process, looking for SystemIdentity.mdb, Current.mdb, etc. Required.
+        d               Directory to process, looking for SystemIdentity.mdb, Current.mdb, etc. Required.
         csv             Directory to save CSV formatted results to. This or --json is required
         json            Directory to save JSON Lines results to. This or --csv is required
         jsonf           File name to save JSON Lines results to. Overrides the default name; requires --json
@@ -20,86 +20,59 @@ Process Microsoft User Access Logs! Thanks to KPMG for the initial write up, fou
 
         debug           Show debug information during processing
         trace           Show trace information during processing
-        reader          auto (default), esent, or dissect
-
-
     Examples: SumECmd.exe -d "C:\Temp\sum" --csv "C:\Temp\"
               SumECmd.exe -d "C:\Temp\sum" --json "C:\Temp\json" --jsonf sum.json
               SumECmd.exe -d "C:\Temp\sum" --csv "C:\Temp\csv" --json "C:\Temp\json" --wd false
 
           Short options (single letter) are prefixed with a single dash. Long commands are prefixed with two dashes
 
-## Reading databases on macOS and Linux
+## Included C# reader and Docker build
 
-SumECmd uses `dissect.database` on macOS/Linux and ManagedEsent on Windows.
-`--reader auto` is the default; `--reader dissect` also works on Windows when
-Python is installed. `--reader esent` requires Windows. Both readers feed the
-same UAL models and CSV/JSON exporters.
+The source library is included in `EseRecovery/` and built by project reference. It replaces the native Windows ESE dependency while preserving SumECmd's original single reading path: clean databases are opened directly, and dirty databases are recovered automatically when the required adjacent logs are available. Missing logs or unsupported ESE operations stop processing before any output is exported. There is no backend or recovery-mode option in the public CLI.
 
-The input directory must contain `SystemIdentity.mdb` and `Current.mdb`.
-Databases listed in `CHAINED_DATABASES` are read from the same directory when
-present. File-name matching is case-insensitive; chained paths outside the input
-directory are rejected. This command processes one SUM directory, not a recursive
-collection of unrelated machines.
+All platforms use the same C# implementation; Python, Dissect, Windows ESENT and external build contexts are not required. JSON Lines and CSV retain their existing export contract. See the [library scope](EseRecovery/README.md); the included implementation does not yet cover every operation supported by Windows ESE.
 
-### Docker
+Run these commands from the repository root. The single Dockerfile publishes .NET 9 self-contained files and uses Ubuntu 24.04 for the Linux runtime:
 
 ```sh
-docker build -t sumecmd .
-mkdir -p output
-docker run --rm --network none --read-only \
-  --mount "type=bind,source=$PWD/evidence/Sum,target=/input,readonly" \
-  --mount "type=bind,source=$PWD/output,target=/output" \
-  sumecmd -d /input --json /output --jsonf sum.json --csv /output
+docker buildx build --platform linux/amd64 --load -t sumecmd:local .
+docker buildx build --platform linux/amd64 --target export \
+  --output type=local,dest=artifacts/bin/linux-x64 .
+docker buildx build --target export --build-arg DOTNET_RID=osx-arm64 \
+  --output type=local,dest=artifacts/bin/osx-arm64 .
 ```
 
-Replace `evidence/Sum` with your acquired SUM directory. The image includes .NET,
-Python and pinned Dissect dependencies, and selects ARM64 or x64 automatically.
-For a different target use, for example,
-`docker buildx build --platform linux/amd64 --load -t sumecmd .`. The default final stage is `runtime`.
-`--target export` retains binary-only export support; those binaries still need
-Python and the requirements below on non-Windows hosts.
-
-### Native macOS/Linux
-
-Requires the .NET 9 SDK and Python 3.10 or newer (macOS's system Python 3.9 is not
-sufficient). Create an isolated Python environment with an appropriate interpreter:
+The exported directories include the executable and its .NET runtime: keep the entire directory when copying it to another host. Linux x64 requires a compatible Linux system (the container uses Ubuntu 24.04); `osx-arm64` is for Apple Silicon. After exporting the macOS build from Linux, apply an ad-hoc signature to its apphost on the Mac before running it:
 
 ```sh
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -r SumData/python/requirements.txt
-export SUM_PYTHON="$PWD/.venv/bin/python"
-dotnet run --project SumECmd/SumECmd.csproj -f net9.0 -- \
-  -d /path/to/Sum --json /path/to/output --jsonf sum.json
+codesign --force --sign - artifacts/bin/osx-arm64/SumECmd
 ```
 
-`SUM_PYTHON` selects the interpreter executable, not a shell command. If unset,
-SumECmd starts `python3`. The helper is embedded in SumData; no separate script
-installation is needed. It reads the database in binary read-only mode, resolves
-ESE values and streams a versioned transport to C#. FILETIME values remain raw
-64-bit values, preserving 100 ns precision; Python does not calculate UAL dates.
-Each helper process has a 30-minute maximum run time and is terminated on failure.
+Run the macOS ARM64 binary directly with the original CLI plus the JSON options:
 
-### Completeness and exit codes
+```sh
+mkdir -p artifacts/manual
+./artifacts/bin/osx-arm64/SumECmd \
+  -d /Users/fmantuano/Downloads \
+  --json "$PWD/artifacts/manual" --jsonf sum-mac.jsonl
+```
 
-- **0**: parsing and export completed without database completeness warnings.
-- **1**: a fatal read/helper/JSON export or argument error. A parser failure stops
-  before either export starts and preserves existing output.
-- **2**: output was exported, but a database was not in Clean Shutdown state, a
-  requested table was missing, or a referenced chained database was unavailable.
-  Inspect the diagnostics before treating the output as complete.
+Equivalent Linux container run, with read-only evidence:
 
-Dissect reads stored database pages. It does **not** replay ESE transaction logs,
-repair databases, or recover deleted records. Dirty Shutdown can therefore yield
-partial or empty results. Keep the acquired database and associated logs; perform
-any recovery separately on copies. Zero extracted rows do not establish absence
-of activity. ManagedEsent retains its existing Windows attachment behavior; use
-working copies with that reader.
+```sh
+docker run --rm --platform linux/amd64 --network none --read-only \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src=/Users/fmantuano/Downloads/SystemIdentity.mdb,dst=/evidence/SystemIdentity.mdb,readonly \
+  --mount type=bind,src=/Users/fmantuano/Downloads/Current.mdb,dst=/evidence/Current.mdb,readonly \
+  --mount type=bind,src="$PWD/artifacts/manual",dst=/out \
+  sumecmd:local -d /evidence --json /out --jsonf sum-linux.jsonl
+```
 
-The current release preserves the existing daily-date convention: `Current.mdb`
-uses the analysis machine's current year; chained databases use their `Year`
-metadata. When examining an older `Current.mdb`, daily dates need separate review.
-A backend change does not resolve this pre-existing interpretation limitation.
+On a Linux x64 host, copy `artifacts/bin/linux-x64/` and run `./SumECmd -d /path/to/evidence --json /path/to/output --jsonf sum.jsonl`. Keep matching ESE logs in the evidence directory alongside dirty databases, as on Windows. Exit code **0** means the export completed; exit code **1** means the database could not be processed and no new output was published.
+
+The supplied `SystemIdentity.mdb` opens successfully, but `Current.mdb` is dirty and its matching transaction logs are absent. Therefore, the complete command above is expected to exit **1 without creating JSON**, consistently on Linux x64 and macOS ARM64. This is the same recovery boundary exposed by a native ESE attachment: a dirty database cannot be declared recovered without its required logs. The original MDB hashes remain unchanged. No automated tests are run as part of the Docker build.
+
+The original daily-date convention is preserved: `Current.mdb` uses the analysis machine's current year; historical databases use their recorded year.
 
 ## JSON Lines output
 
@@ -126,22 +99,7 @@ dotnet test SumTest/SumTest.csproj
 dotnet build SumECmd/SumECmd.csproj --configuration Release
 ```
 
-The export and command-line tests use synthetic records and run without Windows
-ESE. Transport tests also require Python (select it with `SUM_PYTHON`). The original
-Windows database sample tests remain explicit. New private-sample integration tests
-run when `SUM_TEST_SAMPLE_DIR` points to a SUM directory containing both databases.
-No acquired databases are included in the repository or Docker build context.
-
-```sh
-python3.12 -m unittest discover -s SumTest/python -v
-docker build --target test -t sumecmd-test .
-```
-
-The `test` stage runs Python transport tests, C# tests, and builds both .NET targets.
-Synthetic cases cover all exported record types, historical chained daily counts,
-zero versus null counters, FILETIME precision, helper failures/timeouts and
-incomplete databases. Populated activity databases and a Windows comparison are
-still needed to establish full cross-reader equivalence.
+Existing export and command-line tests are retained. The original database sample tests remain explicit because they require external databases. The current local acceptance uses the supplied real databases; no automated tests are run as part of the Docker build.
 
 For the optional ingestion test, set `SUM_ELASTICSEARCH_URL` to a disposable Elasticsearch instance before running the tests. The test creates a uniquely named index, checks all exported timestamp fields using the default `date` mapping, and deletes the index afterward.
 

@@ -1,7 +1,6 @@
 using System.Linq;
 using NUnit.Framework;
 using SumECmd;
-using SumData.Readers;
 
 namespace SumTest;
 
@@ -54,24 +53,6 @@ public class CommandLineTests
         Assert.That(result.Errors.Any(error => error.Message.Contains(message)), Is.True);
         Assert.That(result.Invoke(), Is.Not.Zero);
         Assert.That(invoked, Is.False);
-    }
-
-    [TestCase("auto", EseReaderKind.Auto)]
-    [TestCase("esent", EseReaderKind.Esent)]
-    [TestCase("dissect", EseReaderKind.Dissect)]
-    public void AcceptsExplicitReader(string name, EseReaderKind expected)
-    {
-        ApplicationArguments arguments = null;
-        var command = Program.CreateCommand(value => { arguments = value; return 0; });
-        Assert.That(command.Parse("-d evidence --json output --reader " + name).Invoke(), Is.Zero);
-        Assert.That(arguments.Reader, Is.EqualTo(expected));
-    }
-
-    [Test]
-    public void RejectsUnknownReader()
-    {
-        var command = Program.CreateCommand(_ => { Assert.Fail("Must not invoke"); return 0; });
-        Assert.That(command.Parse("-d evidence --json output --reader unknown").Errors, Is.Not.Empty);
     }
 
     [Test]

@@ -1,8 +1,10 @@
 .git
 **/bin
 **/obj
-**/__pycache__
 **/*.mdb
 **/*.log
 **/*.jsonl
+**/*.dat
 .DS_Store
+
+artifacts/

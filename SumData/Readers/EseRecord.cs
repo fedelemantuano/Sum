@@ -1,27 +1,25 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Runtime.Serialization;
 using System.Text;
 
 namespace SumData.Readers;
 
-// Versioned helper protocol. Values are base64 ESE bytes; text is UTF-16LE.
-[DataContract]
+// ESE values remain raw bytes in-process; text is normalized to UTF-16LE.
 internal sealed class EseRecord
 {
-    [DataMember(Name = "kind")] public string Kind { get; set; }
-    [DataMember(Name = "version")] public int Version { get; set; }
-    [DataMember(Name = "state")] public int State { get; set; }
-    [DataMember(Name = "table")] public string Table { get; set; }
-    [DataMember(Name = "values")] public Dictionary<string, string> Values { get; set; }
-    [DataMember(Name = "columns")] public Dictionary<string, string> Columns { get; set; }
+    public string Kind { get; set; }
+    public int State { get; set; }
+    internal EseRecovery.EseRecoveryReport Recovery { get; set; }
+    public string Table { get; set; }
+    public Dictionary<string, byte[]> Values { get; set; }
+    public Dictionary<string, string> Columns { get; set; }
 
     internal byte[] Bytes(string column)
     {
         if (Values == null || !Values.TryGetValue(column, out var value))
             throw new InvalidDataException($"Missing column {Table}.{column}.");
-        return value == null ? null : Convert.FromBase64String(value);
+        return value;
     }
 
     private byte[] Fixed(string column, int length)
@@ -48,10 +46,3 @@ internal sealed class EseRecord
     }
     internal DateTimeOffset Timestamp(string column) => DateTimeOffset.FromFileTime(Int64(column)).ToUniversalTime();
 }
-
-internal interface IEseReader
-{
-    IEnumerable<EseRecord> ReadDatabase(string fileName, string[] tables);
-}
-
-public enum EseReaderKind { Auto, Esent, Dissect }

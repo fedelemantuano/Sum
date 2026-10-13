@@ -7,7 +7,7 @@ using SumData;
 namespace SumTest;
 
 [TestFixture]
-[Explicit("Requires Windows ESE libraries and the external SUM database samples at the hard-coded paths.")]
+[Explicit("Requires the included ESE library and external SUM database samples at the hard-coded paths.")]
 public class TestMain
 {
 

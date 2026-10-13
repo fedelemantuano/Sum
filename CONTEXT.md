@@ -16,3 +16,6 @@ A UAL record identifying a server role and the first and last times it was seen.
 
 **Source database**:
 The SUM database from which an exported record was extracted.
+
+**Recovered state**:
+The database state exposed after the supported transaction history has been applied and unfinished transactions rolled back. Missing required evidence or unsupported operations prevent declaring that state recovered.
