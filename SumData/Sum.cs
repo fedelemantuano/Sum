@@ -8,6 +8,19 @@ using SumData.Readers;
 
 namespace SumData
 {
+    public sealed class DatabaseReadFailure
+    {
+        internal DatabaseReadFailure(string databasePath, Exception exception)
+        {
+            DatabasePath = databasePath;
+            Exception = exception;
+        }
+
+        public string DatabasePath { get; }
+        public string Message => Exception.Message;
+        public Exception Exception { get; }
+    }
+
     public class Sum
     {
         private readonly PortableEseReader _reader;
@@ -33,6 +46,7 @@ namespace SumData
             RoleInfos = new List<RoleInfo>();
             ChainedDbs = new List<ChainedDbInfo>();
             ProcessedDatabases = new List<ChainedDatabase>();
+            ReadFailures = new List<DatabaseReadFailure>();
             if (!Directory.Exists(directory))
                 throw new DirectoryNotFoundException($"Directory '{directory}' not found!");
             directory = Path.GetFullPath(directory);
@@ -42,7 +56,7 @@ namespace SumData
             if (current == null) throw new FileNotFoundException("Current.mdb not found.");
             Read(sysIdent, IdentityTables, null, 0);
             // Preserve SumECmd's existing Current.mdb year convention.
-            ReadActivity(current, DateTime.Now.Year);
+            TryReadActivity(current, DateTime.Now.Year);
             var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { current };
             foreach (var chain in ChainedDbs)
             {
@@ -56,7 +70,7 @@ namespace SumData
                     Log.Information("Chained database '{FileName}' for year {Year} does not exist! Skipping...", chain.FileName, chain.Year);
                     continue;
                 }
-                if (processed.Add(path)) ReadActivity(path, chain.Year);
+                if (processed.Add(path)) TryReadActivity(path, chain.Year);
             }
         }
 
@@ -68,6 +82,8 @@ namespace SumData
         public List<RoleInfo> RoleInfos { get; }
         public List<ChainedDbInfo> ChainedDbs { get; }
         public List<ChainedDatabase> ProcessedDatabases { get; }
+        public List<DatabaseReadFailure> ReadFailures { get; }
+        public bool HasIncompleteData => ReadFailures.Count != 0;
         private readonly Dictionary<string, EseRecovery.EseRecoveryReport> recoveryReports = new Dictionary<string, EseRecovery.EseRecoveryReport>();
         public IReadOnlyDictionary<string, EseRecovery.EseRecoveryReport> RecoveryReports => recoveryReports;
 
@@ -77,6 +93,28 @@ namespace SumData
             Read(path, ActivityTables, db, year);
             ProcessedDatabases.Add(db);
         }
+
+        private void TryReadActivity(string path, int year)
+        {
+            try
+            {
+                ReadActivity(path, year);
+            }
+            catch (Exception ex) when (IsDatabaseReadFailure(ex))
+            {
+                recoveryReports.Remove(path);
+                ReadFailures.Add(new DatabaseReadFailure(path, ex));
+            }
+        }
+
+        private static bool IsDatabaseReadFailure(Exception exception) =>
+            exception is EseRecovery.RecoveryRequiredException ||
+            exception is IOException ||
+            exception is NotSupportedException ||
+            exception is UnauthorizedAccessException ||
+            exception is ArgumentException ||
+            exception is OverflowException ||
+            exception is FormatException;
 
         private void Read(string path, string[] tables, ChainedDatabase db, int year)
         {

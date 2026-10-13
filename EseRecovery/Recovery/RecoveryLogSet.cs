@@ -36,12 +36,13 @@ internal static class RecoveryLogSet
         string directory=options.LogDirectory??Path.GetDirectoryName(Path.GetFullPath(databasePath))!;
         string? basename=options.LogBaseName;
         if(basename!=null&&!Regex.IsMatch(basename,"^[A-Za-z0-9]{3}$"))throw new ArgumentException("ESE log basename must contain exactly three ASCII letters or digits.");
-        var candidates=new List<string>();int files=0;
+        var candidates=new List<string>();int files=0;int currentLogNames=0;
         foreach(string path in Directory.EnumerateFiles(directory))
         {
             if(++files>10000)throw new InvalidDataException("Recovery directory file budget exceeded.");
             string name=Path.GetFileName(path);
             if(!Regex.IsMatch(name,@"^[A-Za-z0-9]{3}\.log$",RegexOptions.IgnoreCase))continue;
+            currentLogNames++;
             if(basename!=null&&!name.Equals(basename+".log",StringComparison.OrdinalIgnoreCase))continue;
             if(basename==null&&new FileInfo(path).Length<4096)continue;
             byte[] raw=ReadHeader(path,false);
@@ -51,7 +52,9 @@ internal static class RecoveryLogSet
             if(h!=null&&h.LogSignature==database.LogSignature)candidates.Add(path);
         }
         if(candidates.Count!=1)throw new RecoveryRequiredException(candidates.Count==0?
-            "Required current ESE log is missing or has a different signature; recovery was not performed.":
+            (currentLogNames==0?
+                "Database is in Dirty Shutdown state, but no current ESE transaction log was found in '"+directory+"'. Recovery requires the matching log set from the same acquisition.":
+                "Database is in Dirty Shutdown state, but none of the current ESE transaction logs in '"+directory+"' matches its log signature. Recovery was not performed."):
             "Multiple matching current ESE logs; specify LogDirectory and LogBaseName.");
         string current=candidates[0];basename=Path.GetFileNameWithoutExtension(current);
         var currentHeader=(LogHeader)HeaderInspector.Inspect(new MemoryStream(ReadHeader(current)));

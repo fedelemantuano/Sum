@@ -243,6 +243,7 @@ internal class Program
         var timestamp = DateTimeOffset.UtcNow;
             
         Sum sd = null;
+        var exitCode = 0;
 
         try
         {
@@ -250,7 +251,7 @@ internal class Program
             Console.WriteLine();
             sd = new Sum(d);
             Console.WriteLine();
-            Log.Information("Processing complete!");
+            Log.Information(sd.HasIncompleteData ? "Processing completed with incomplete data." : "Processing complete!");
             Console.WriteLine();
             Log.Information("Summary info:");
 
@@ -259,17 +260,37 @@ internal class Program
             Log.Information("{ChainedDb} {ChainedDbsCount:N0}","Chained DB info count:".PadRight(30),sd.ChainedDbs.Count);
             Log.Information("{ProcessedDb} {ProcessedDatabasesCount:N0}","Processed DB info count:".PadRight(30),sd.ProcessedDatabases.Count);
 
+            if (sd.HasIncompleteData)
+            {
+                exitCode = 2;
+                foreach (var failure in sd.ReadFailures)
+                {
+                    if (debug || trace)
+                        Log.Warning(failure.Exception, "Database '{Database}' was skipped: {Message}", failure.DatabasePath, failure.Message);
+                    else
+                        Log.Warning("Database '{Database}' was skipped: {Message}", failure.DatabasePath, failure.Message);
+                }
+                Log.Warning("Processing is incomplete: {FailureCount:N0} database(s) could not be read. Validated records from the other databases will be exported.",
+                    sd.ReadFailures.Count);
+            }
+
             Console.WriteLine();
         }
         catch (FileNotFoundException fe)
         {
-            Log.Error(fe,"File not found: {Message}",fe.Message);
+            if (debug || trace)
+                Log.Error(fe,"File not found: {Message}",fe.Message);
+            else
+                Log.Error("File not found: {Message}",fe.Message);
             Console.WriteLine();
             return 1;
         }
         catch (Exception e)
         {
-            Log.Error(e, "Error reading SUM databases: {Message}. No output was exported.", e.Message);
+            if (debug || trace)
+                Log.Error(e, "Error reading SUM databases: {Message} No output was exported.", e.Message);
+            else
+                Log.Error("Error reading SUM databases: {Message} No output was exported.", e.Message);
             return 1;
         }
 
@@ -308,7 +329,7 @@ internal class Program
 
         Log.Information("Processing completed in {TotalSeconds:N4} seconds",sw.Elapsed.TotalSeconds);
         Console.WriteLine();
-        return 0;
+        return exitCode;
     }
 
     internal static void ExportCsv(SumExportData data, string csv, string dt, bool wd, DateTimeOffset timestamp)

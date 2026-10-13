@@ -28,9 +28,34 @@ Process Microsoft User Access Logs! Thanks to KPMG for the initial write up, fou
 
 ## Included C# reader and Docker build
 
-The source library is included in `EseRecovery/` and built by project reference. It replaces the native Windows ESE dependency while preserving SumECmd's original single reading path: clean databases are opened directly, and dirty databases are recovered automatically when the required adjacent logs are available. Missing logs or unsupported ESE operations stop processing before any output is exported. There is no backend or recovery-mode option in the public CLI.
+The source library is included in `EseRecovery/` and built by project reference. It replaces the native Windows ESE dependency while preserving SumECmd's original single reading path: clean databases are opened directly, and dirty databases are recovered automatically when the required adjacent logs are available. Each activity database is processed independently. A database that cannot be recovered is skipped, while records from `SystemIdentity.mdb` and successfully completed activity databases remain exportable. There is no backend or recovery-mode option in the public CLI.
 
 All platforms use the same C# implementation; Python, Dissect, Windows ESENT and external build contexts are not required. JSON Lines and CSV retain their existing export contract. See the [library scope](EseRecovery/README.md); the included implementation does not yet cover every operation supported by Windows ESE.
+
+### Comparison with Windows `esent.dll`
+
+Windows `esent.dll` is the complete ESE database engine. The included `EseRecovery` project is a read-only forensic reader with bounded transaction recovery for the supported SUM and SRUM evidence formats. It intentionally fails instead of exposing a recovered state when a required operation is outside its implemented scope. See Microsoft's [ESE overview](https://learn.microsoft.com/en-us/windows/win32/extensible-storage-engine/extensible-storage-engine) and [ESE files and recovery](https://learn.microsoft.com/en-us/windows/win32/extensible-storage-engine/extensible-storage-engine-files).
+
+| Capability | Windows `esent.dll` | Included `EseRecovery` |
+| --- | --- | --- |
+| Read clean ESE databases | Full engine support | Supported formats only |
+| Read SUM and SRUM tables | Yes | Yes |
+| Validate page and log checksums | Yes | Yes |
+| Validate log signatures and generations | Yes | Yes |
+| Replay inserts, replacements and deletes | Full engine support | Supported unique leaf operations only |
+| Commit, rollback and nested transactions | Full engine support | Bounded implementation |
+| Version store and concurrent updates | Full engine support | Simple validated cases only |
+| B-tree page split, merge and root operations | Yes | No |
+| Page allocation and space-tree recovery | Yes | No |
+| Secondary and non-unique indexes | Yes | No |
+| Multiple databases in one log stream | Yes | No |
+| Torn-write and shadow-log recovery | Yes | No |
+| Create or modify databases | Yes | No; read-only in-memory overlay |
+| Backup, restore and maintenance APIs | Yes | No |
+| General database API | Windows `Jet*` API | Purpose-built forensic API |
+| Platforms | Windows | Linux, macOS and Windows |
+
+Matching output on a clean database demonstrates record-reading compatibility, not complete engine equivalence. A dirty database that reports zero redo and zero undo operations validates log-chain attachment but does not exercise page-changing recovery. Full parity would require Windows-reference fixtures covering committed unflushed changes, rollback, structural B-tree changes, secondary indexes and concurrent versions. Missing required logs cannot be reconstructed by either implementation.
 
 Run these commands from the repository root. The single Dockerfile publishes .NET 9 self-contained files and uses Ubuntu 24.04 for the Linux runtime:
 
@@ -68,9 +93,9 @@ docker run --rm --platform linux/amd64 --network none --read-only \
   sumecmd:local -d /evidence --json /out --jsonf sum-linux.jsonl
 ```
 
-On a Linux x64 host, copy `artifacts/bin/linux-x64/` and run `./SumECmd -d /path/to/evidence --json /path/to/output --jsonf sum.jsonl`. Keep matching ESE logs in the evidence directory alongside dirty databases, as on Windows. Exit code **0** means the export completed; exit code **1** means the database could not be processed and no new output was published.
+On a Linux x64 host, copy `artifacts/bin/linux-x64/` and run `./SumECmd -d /path/to/evidence --json /path/to/output --jsonf sum.jsonl`. Keep matching ESE logs in the evidence directory alongside dirty databases, as on Windows. Exit code **0** means the export is complete, **2** means validated records were exported but one or more activity databases were skipped, and **1** means processing or publication failed without a usable new output.
 
-The supplied `SystemIdentity.mdb` opens successfully, but `Current.mdb` is dirty and its matching transaction logs are absent. Therefore, the complete command above is expected to exit **1 without creating JSON**, consistently on Linux x64 and macOS ARM64. This is the same recovery boundary exposed by a native ESE attachment: a dirty database cannot be declared recovered without its required logs. The original MDB hashes remain unchanged. No automated tests are run as part of the Docker build.
+When `SystemIdentity.mdb` opens successfully but `Current.mdb` is dirty and its matching transaction logs are absent, SumECmd reports the missing logs, continues with independently readable chained databases, exports the validated records, and exits **2**. It does not export unrecovered pages from `Current.mdb`. If no usable database can be processed, it exits **1** without publishing a new output. The original MDB files remain unchanged. No automated tests are run as part of the Docker build.
 
 The original daily-date convention is preserved: `Current.mdb` uses the analysis machine's current year; historical databases use their recorded year.
 
